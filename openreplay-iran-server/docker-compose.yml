@@ -38,7 +38,7 @@ services:
   # ═══════════════════════════════════════════════════════════════════════════
 
   postgresql:
-    image: ghcr.io/openreplay/postgres:${POSTGRES_VERSION:-17}
+    image: ghcr-mirror.liara.ir/openreplay/postgres:${POSTGRES_VERSION:-17}
     volumes:
       - pgdata:/bitnami/postgresql
     networks:
@@ -55,7 +55,7 @@ services:
     restart: unless-stopped
 
   clickhouse:
-    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.11-alpine}
+    image: docker-mirror.liara.ir/clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.11-alpine}
     volumes:
       - clickhouse:/var/lib/clickhouse
     networks:
@@ -74,7 +74,7 @@ services:
     restart: unless-stopped
 
   redis:
-    image: ghcr.io/openreplay/valkey:${REDIS_VERSION:-8}
+    image: ghcr-mirror.liara.ir/openreplay/valkey:${REDIS_VERSION:-8}
     volumes:
       - redisdata:/data
     networks:
@@ -91,7 +91,7 @@ services:
     restart: unless-stopped
 
   minio:
-    image: rustfs/rustfs:${RUSTFS_VERSION:-2025}
+    image: docker-mirror.liara.ir/rustfs/rustfs:${RUSTFS_VERSION:-2025}
     volumes:
       - miniodata:/data
     networks:
@@ -119,7 +119,7 @@ services:
   # ═══════════════════════════════════════════════════════════════════════════
 
   fs-permission-init:
-    image: debian:stable-slim
+    image: docker-mirror.liara.ir/debian:stable-slim
     exclude_from_hc: true
     volumes:
       - shared-volume:/mnt/efs
@@ -134,7 +134,7 @@ services:
     restart: "no"
 
   minio-init:
-    image: minio/mc:latest
+    image: docker-mirror.liara.ir/minio/mc:latest
     exclude_from_hc: true
     depends_on:
       minio:
@@ -163,7 +163,7 @@ services:
     restart: "no"
 
   db-init:
-    image: ghcr.io/openreplay/postgres:${POSTGRES_VERSION:-17}
+    image: ghcr-mirror.liara.ir/openreplay/postgres:${POSTGRES_VERSION:-17}
     exclude_from_hc: true
     depends_on:
       postgresql:
@@ -192,7 +192,7 @@ services:
     restart: "no"
 
   clickhouse-init:
-    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.11-alpine}
+    image: docker-mirror.liara.ir/clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.11-alpine}
     exclude_from_hc: true
     depends_on:
       clickhouse:
