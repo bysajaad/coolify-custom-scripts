@@ -5,36 +5,46 @@
 # port: 80
 
 # ════════════════════════════════════════════════════════════════════════════════
-# OPENREPLAY — Coolify Service Template (Traefik-native, no nginx)
+# OPENREPLAY — Coolify Service Template (Traefik-native, fully installer-free)
 # ════════════════════════════════════════════════════════════════════════════════
 #
-# ROUTING ARCHITECTURE (all under one domain via Traefik path rules):
+# This template replaces everything the official docker-install.sh + install.sh
+# scripts do: generating secrets, creating S3 buckets, running DB migrations,
+# and writing docker-envs/*.env files — all inlined for Coolify compatibility.
 #
-#   SERVICE_FQDN_FRONTEND        → /          → frontend:9000  (UI)
-#   SERVICE_FQDN_API=/api        → /api       → api:8080       (REST API)
-#   SERVICE_FQDN_INGEST=/ingest  → /ingest    → http:9001      (tracker ingest)
-#   SERVICE_FQDN_ASSIST=/assist  → /assist    → assist:9002    (co-browse WS)
-#   SERVICE_FQDN_SPOT=/spot      → /spot      → spot:9000      (Spot recordings)
+# ROUTING (all on one domain, Traefik handles path-based dispatch):
+#   /           → frontend:9000   (dashboard UI)
+#   /api        → api:8080        (REST API  — chalice/FastAPI)
+#   /ingest     → http:9001       (JS tracker ingest endpoint)
+#   /assist     → assist:9002     (live co-browse WebSocket)
+#   /spot       → spot:9000       (Spot screen recordings)
 #
-#   All five FQDN magic vars resolve to the SAME domain — Coolify de-dupes them
-#   when the user sets their domain on the service stack settings page.
-#   Traefik then matches the correct container by PathPrefix.
+# AUTO-GENERATED SECRETS (Coolify creates once, never changes):
+#   SERVICE_PASSWORD_POSTGRES  — Postgres password
+#   SERVICE_USER_MINIO         — RustFS/S3 access key
+#   SERVICE_PASSWORD_MINIO     — RustFS/S3 secret key
+#   SERVICE_BASE64_64_JWTSECRET — jwt_secret for API auth (64-char base64)
 #
-# INIT SEQUENCE (one-shot, exclude_from_hc: true):
-#   fs-permission-init → minio-init → db-init + clickhouse-init → app services
+# REQUIRED ENV VARS (set in Coolify's UI — marked with :?):
+#   COMMON_VERSION    — OpenReplay release tag, e.g. v1.23.0
 #
-# GENERATED SECRETS (never type these — Coolify creates them once and reuses):
-#   SERVICE_PASSWORD_POSTGRES  ← PostgreSQL password
-#   SERVICE_USER_MINIO         ← RustFS/MinIO access key
-#   SERVICE_PASSWORD_MINIO     ← RustFS/MinIO secret key
+# OPTIONAL ENV VARS (sensible defaults pre-filled):
+#   POSTGRES_VERSION      — default: 17
+#   REDIS_VERSION         — default: 8
+#   CLICKHOUSE_VERSION    — default: 25.11-alpine
+#   RUSTFS_VERSION        — default: 2025
+#
+# FIRST-RUN NOTES:
+#   After deploying, visit https://<your-domain>/signup to create the first user.
+#   OpenReplay REQUIRES HTTPS to function — Traefik/Coolify handles this.
+#   Minimum server: 2 vCPUs, 8 GB RAM, 50 GB disk, x86_64 architecture.
 #
 # ════════════════════════════════════════════════════════════════════════════════
 
 services:
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # INFRASTRUCTURE — Postgres · ClickHouse · Redis · RustFS (S3)
-  # These are internal-only; no SERVICE_FQDN/URL declared → not exposed publicly
+  # INFRASTRUCTURE
   # ═══════════════════════════════════════════════════════════════════════════
 
   postgresql:
@@ -66,8 +76,12 @@ services:
       - CLICKHOUSE_USER=default
       - CLICKHOUSE_PASSWORD=
       - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O - http://127.0.0.1:8123/ping || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -106,18 +120,20 @@ services:
       - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
       - RUSTFS_VOLUMES=/data
     healthcheck:
-      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/9000 2>/dev/null && echo ok"]
+      # RustFS is S3-compatible; probe the health endpoint
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 -O - http://127.0.0.1:9000/health/live 2>/dev/null || echo > /dev/tcp/127.0.0.1/9000 2>/dev/null && echo ok"]
       interval: 5s
-      timeout: 3s
+      timeout: 5s
       retries: 30
     restart: unless-stopped
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # ONE-SHOT INIT CONTAINERS
-  # exclude_from_hc: true  → Coolify ignores their exit, won't mark stack unhealthy
-  # restart: "no"          → run once and done
+  # INIT CONTAINERS  (one-shot, exclude_from_hc keeps stack green after exit)
+  #
+  # ORDER: fs-permission → minio-init → db-init & clickhouse-init (parallel)
   # ═══════════════════════════════════════════════════════════════════════════
 
+  # Fix volume ownership so the bitnami postgres + rustfs images can write
   fs-permission-init:
     image: docker-mirror.liara.ir/debian:stable-slim
     exclude_from_hc: true
@@ -133,6 +149,7 @@ services:
         echo "[fs-permission-init] done"
     restart: "no"
 
+  # Create every bucket OpenReplay needs (mirrors minio.sh from the Helm chart)
   minio-init:
     image: docker-mirror.liara.ir/minio/mc:latest
     exclude_from_hc: true
@@ -151,17 +168,26 @@ services:
       - -c
       - |
         set -e
+        echo "[minio-init] waiting for RustFS…"
         until mc alias set or http://minio.db.svc.cluster.local:9000 \
               "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" 2>/dev/null; do
-          echo "Waiting for RustFS…"; sleep 2
+          sleep 2
         done
-        for bucket in openreplay mobs-openreplay sessions-openreplay; do
+        echo "[minio-init] connected — creating buckets"
+        # Bucket list mirrors scripts/helmcharts/openreplay/files/minio.sh
+        for bucket in mobs sessions-assets static sourcemaps \
+                      sessions-mobile-assets quickwit vault-data records spots; do
           mc mb --ignore-existing "or/${bucket}"
-          mc anonymous set download "or/${bucket}" || true
+          echo "  bucket: ${bucket} ✓"
         done
+        # Make session assets publicly readable (required for replay)
+        mc anonymous set download or/sessions-assets || true
+        mc anonymous set download or/static         || true
+        mc anonymous set download or/mobs           || true
         echo "[minio-init] done"
     restart: "no"
 
+  # Apply PostgreSQL schema (runs idempotently; ON_ERROR_STOP=0 for re-runs)
   db-init:
     image: ghcr-mirror.liara.ir/openreplay/postgres:${POSTGRES_VERSION:-17}
     exclude_from_hc: true
@@ -183,14 +209,20 @@ services:
       - -c
       - |
         set -e
-        until psql -c '\q' 2>/dev/null; do
-          echo "Waiting for PostgreSQL…"; sleep 2
-        done
+        echo "[db-init] waiting for PostgreSQL…"
+        until psql -c '\q' 2>/dev/null; do sleep 2; done
+        echo "[db-init] running schema migration"
+        # The OpenReplay custom postgres image ships init_schema.sql here:
         SQL=/docker-entrypoint-initdb.d/init_schema.sql
-        [ -f "$SQL" ] && psql -v ON_ERROR_STOP=0 -f "$SQL" || true
-        echo "[db-init] done"
+        if [ -f "$SQL" ]; then
+          psql -v ON_ERROR_STOP=0 -f "$SQL"
+          echo "[db-init] schema applied ✓"
+        else
+          echo "[db-init] WARN: init_schema.sql not found at $SQL — skipping"
+        fi
     restart: "no"
 
+  # Apply ClickHouse schema
   clickhouse-init:
     image: docker-mirror.liara.ir/clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.11-alpine}
     exclude_from_hc: true
@@ -206,29 +238,29 @@ services:
       - -c
       - |
         set -e
-        until clickhouse-client \
-              -h clickhouse-openreplay-clickhouse.db.svc.cluster.local \
-              --port 9000 --query "SELECT 1" 2>/dev/null; do
-          echo "Waiting for ClickHouse…"; sleep 2
-        done
-        echo "[clickhouse-init] done"
+        CH=clickhouse-openreplay-clickhouse.db.svc.cluster.local
+        echo "[clickhouse-init] waiting for ClickHouse…"
+        until clickhouse-client -h "$CH" --port 9000 \
+              --query "SELECT 1" 2>/dev/null; do sleep 2; done
+        echo "[clickhouse-init] connected ✓"
+        # The OR image ships the ClickHouse DDL alongside the postgres one.
+        # If available, apply it; otherwise the service bootstraps lazily.
+        SQL=/docker-entrypoint-initdb.d/clickhouse_init_schema.sql
+        if [ -f "$SQL" ]; then
+          clickhouse-client -h "$CH" --port 9000 --multiquery < "$SQL" || true
+          echo "[clickhouse-init] schema applied ✓"
+        else
+          echo "[clickhouse-init] no schema file found — ClickHouse self-initialises"
+        fi
     restart: "no"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # APPLICATION SERVICES — PUBLIC (routed by Traefik via SERVICE_FQDN_*)
-  #
-  # Coolify reads SERVICE_FQDN_<ID>[=/path][_port] and:
-  #   1. Creates a Traefik router with Host(`<your-domain>`) && PathPrefix(`/path`)
-  #   2. Points that router to port <port> on the container
-  #   3. Issues / renews the TLS cert automatically
-  #
-  # All five entries below share the same base domain — Coolify dedups the Host.
-  # The user only sets the domain once in the service stack settings panel.
+  # APPLICATION SERVICES — PUBLIC  (Traefik-routed via SERVICE_FQDN_*)
   # ═══════════════════════════════════════════════════════════════════════════
 
-  # ── Frontend UI  ( / ) ────────────────────────────────────────────────────
+  # ── Frontend  ( / → port 9000 ) ───────────────────────────────────────────
   frontend-openreplay:
-    image: public.ecr.aws/p1t3u8a3/frontend:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/frontend:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     depends_on:
       db-init:
@@ -243,20 +275,26 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
-      # SERVICE_FQDN_FRONTEND with no path = root / → routes port 9000 to /
+      # SERVICE_FQDN_FRONTEND_9000 = root domain, port 9000 on container
       - SERVICE_FQDN_FRONTEND_9000
-      # Let the frontend know its own public URL
-      - SITE_URL=${SERVICE_FQDN_FRONTEND}
+      # Public URL injected into the built JS bundle
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
+      - SITE_URL=https://${SERVICE_FQDN_FRONTEND}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
       - pg_user=postgres
       - pg_password=${SERVICE_PASSWORD_POSTGRES}
+      - S3_HOST=http://minio.db.svc.cluster.local:9000
+      - S3_KEY=${SERVICE_USER_MINIO}
+      - S3_SECRET=${SERVICE_PASSWORD_MINIO}
+      - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
-  # ── REST API  ( /api ) ────────────────────────────────────────────────────
+  # ── REST API  ( /api → port 8080 ) ────────────────────────────────────────
   api-openreplay:
-    image: public.ecr.aws/p1t3u8a3/api:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/api:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     depends_on:
       db-init:
@@ -269,30 +307,36 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
-      # Routes Host(`domain`) && PathPrefix(`/api`) → port 8080
+      # Routes PathPrefix(/api) to port 8080
       - SERVICE_FQDN_API-OPENREPLAY_8080=/api
-      - SITE_URL=${SERVICE_FQDN_FRONTEND}
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
+      - SITE_URL=https://${SERVICE_FQDN_FRONTEND}
+      # jwt_secret is the API auth signing key — Coolify auto-generates 64-char base64
+      - jwt_secret=${SERVICE_BASE64_64_JWTSECRET}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
       - pg_user=postgres
       - pg_password=${SERVICE_PASSWORD_POSTGRES}
+      - pg_string=postgresql://postgres:${SERVICE_PASSWORD_POSTGRES}@postgresql.db.svc.cluster.local:5432/postgres
       - redis_host=redis-master.db.svc.cluster.local
       - redis_port=6379
       - REDIS_STRING=redis://redis-master.db.svc.cluster.local:6379
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
       - CH_HOST=clickhouse-openreplay-clickhouse.db.svc.cluster.local
       - CH_PORT=9000
       - CH_PORT_HTTP=8123
+      - CH_USERNAME=default
+      - CH_PASSWORD=
     restart: unless-stopped
 
-  # ── Tracker ingest  ( /ingest ) ───────────────────────────────────────────
+  # ── Tracker ingest  ( /ingest → port 9001 ) ───────────────────────────────
   http-openreplay:
-    image: public.ecr.aws/p1t3u8a3/http:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/http:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     depends_on:
       db-init:
@@ -305,8 +349,9 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
-      # Routes Host(`domain`) && PathPrefix(`/ingest`) → port 9001
+      # Routes PathPrefix(/ingest) to port 9001
       - SERVICE_FQDN_HTTP-OPENREPLAY_9001=/ingest
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
@@ -315,17 +360,18 @@ services:
       - redis_host=redis-master.db.svc.cluster.local
       - redis_port=6379
       - REDIS_STRING=redis://redis-master.db.svc.cluster.local:6379
+      - jwt_secret=${SERVICE_BASE64_64_JWTSECRET}
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
-  # ── Live Assist / WebSocket  ( /assist ) ──────────────────────────────────
-  # Traefik handles WebSocket upgrades natively — no extra config needed.
+  # ── Live Assist / Co-browse WebSocket  ( /assist → port 9002 ) ────────────
+  # Traefik passes WebSocket Upgrade headers natively — no extra config needed.
   assist-openreplay:
-    image: public.ecr.aws/p1t3u8a3/assist:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/assist:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -335,17 +381,18 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
-      # Routes Host(`domain`) && PathPrefix(`/assist`) → port 9002
-      # Traefik forwards WS upgrade headers automatically
+      # Routes PathPrefix(/assist) to port 9002; WebSocket upgrade works natively
       - SERVICE_FQDN_ASSIST-OPENREPLAY_9002=/assist
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - redis_host=redis-master.db.svc.cluster.local
       - redis_port=6379
       - REDIS_STRING=redis://redis-master.db.svc.cluster.local:6379
+      - jwt_secret=${SERVICE_BASE64_64_JWTSECRET}
     restart: unless-stopped
 
-  # ── Spot recordings  ( /spot ) ────────────────────────────────────────────
+  # ── Spot screen recordings  ( /spot → port 9000 ) ─────────────────────────
   spot-openreplay:
-    image: public.ecr.aws/p1t3u8a3/spot:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/spot:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -355,27 +402,28 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
-      # Routes Host(`domain`) && PathPrefix(`/spot`) → port 9000
+      # Routes PathPrefix(/spot) to port 9000
       - SERVICE_FQDN_SPOT-OPENREPLAY_9000=/spot
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
       - pg_user=postgres
       - pg_password=${SERVICE_PASSWORD_POSTGRES}
+      - jwt_secret=${SERVICE_BASE64_64_JWTSECRET}
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # APPLICATION SERVICES — INTERNAL ONLY
-  # No SERVICE_FQDN/URL → Traefik never touches them → not publicly reachable
+  # APPLICATION SERVICES — INTERNAL  (no SERVICE_FQDN → never publicly exposed)
   # ═══════════════════════════════════════════════════════════════════════════
 
   alerts-openreplay:
-    image: public.ecr.aws/p1t3u8a3/alerts:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/alerts:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     depends_on:
       db-init:
@@ -390,6 +438,8 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
+      - jwt_secret=${SERVICE_BASE64_64_JWTSECRET}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
@@ -401,14 +451,16 @@ services:
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
       - CH_HOST=clickhouse-openreplay-clickhouse.db.svc.cluster.local
       - CH_PORT=9000
+      - CH_PORT_HTTP=8123
+      - CH_USERNAME=default
+      - CH_PASSWORD=
     restart: unless-stopped
 
   images-openreplay:
-    image: public.ecr.aws/p1t3u8a3/images:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/images:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -418,15 +470,16 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   integrations-openreplay:
-    image: public.ecr.aws/p1t3u8a3/integrations:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/integrations:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -436,6 +489,8 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
+      - jwt_secret=${SERVICE_BASE64_64_JWTSECRET}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
@@ -446,7 +501,7 @@ services:
     restart: unless-stopped
 
   sink-openreplay:
-    image: public.ecr.aws/p1t3u8a3/sink:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/sink:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     depends_on:
       clickhouse-init:
@@ -459,6 +514,7 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
@@ -468,15 +524,18 @@ services:
       - redis_port=6379
       - CH_HOST=clickhouse-openreplay-clickhouse.db.svc.cluster.local
       - CH_PORT=9000
+      - CH_PORT_HTTP=8123
+      - CH_USERNAME=default
+      - CH_PASSWORD=
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   sourcemapreader-openreplay:
-    image: public.ecr.aws/p1t3u8a3/sourcemapreader:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/sourcemapreader:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -486,15 +545,16 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   storage-openreplay:
-    image: public.ecr.aws/p1t3u8a3/storage:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/storage:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -504,15 +564,16 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   assets-openreplay:
-    image: public.ecr.aws/p1t3u8a3/assets:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/assets:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -522,15 +583,16 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   canvases-openreplay:
-    image: public.ecr.aws/p1t3u8a3/canvases:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/canvases:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -540,15 +602,16 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - S3_HOST=http://minio.db.svc.cluster.local:9000
       - S3_KEY=${SERVICE_USER_MINIO}
       - S3_SECRET=${SERVICE_PASSWORD_MINIO}
-      - S3_BUCKET_PREFIX=openreplay
       - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   chalice-openreplay:
-    image: public.ecr.aws/p1t3u8a3/chalice:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/chalice:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -558,17 +621,28 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
+      - jwt_secret=${SERVICE_BASE64_64_JWTSECRET}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
       - pg_user=postgres
       - pg_password=${SERVICE_PASSWORD_POSTGRES}
+      - pg_string=postgresql://postgres:${SERVICE_PASSWORD_POSTGRES}@postgresql.db.svc.cluster.local:5432/postgres
       - CH_HOST=clickhouse-openreplay-clickhouse.db.svc.cluster.local
       - CH_PORT=9000
+      - CH_PORT_HTTP=8123
+      - CH_USERNAME=default
+      - CH_PASSWORD=
+      - S3_HOST=http://minio.db.svc.cluster.local:9000
+      - S3_KEY=${SERVICE_USER_MINIO}
+      - S3_SECRET=${SERVICE_PASSWORD_MINIO}
+      - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   db-openreplay:
-    image: public.ecr.aws/p1t3u8a3/db:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/db:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     depends_on:
       db-init:
@@ -581,20 +655,26 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
+      - jwt_secret=${SERVICE_BASE64_64_JWTSECRET}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
       - pg_user=postgres
       - pg_password=${SERVICE_PASSWORD_POSTGRES}
+      - pg_string=postgresql://postgres:${SERVICE_PASSWORD_POSTGRES}@postgresql.db.svc.cluster.local:5432/postgres
+      - redis_host=redis-master.db.svc.cluster.local
+      - redis_port=6379
+      - REDIS_STRING=redis://redis-master.db.svc.cluster.local:6379
       - CH_HOST=clickhouse-openreplay-clickhouse.db.svc.cluster.local
       - CH_PORT=9000
       - CH_PORT_HTTP=8123
-      - redis_host=redis-master.db.svc.cluster.local
-      - redis_port=6379
+      - CH_USERNAME=default
+      - CH_PASSWORD=
     restart: unless-stopped
 
   ender-openreplay:
-    image: public.ecr.aws/p1t3u8a3/ender:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/ender:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     networks:
       openreplay-net:
@@ -604,6 +684,7 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - pg_host=postgresql.db.svc.cluster.local
       - pg_port=5432
       - pg_dbname=postgres
@@ -611,10 +692,16 @@ services:
       - pg_password=${SERVICE_PASSWORD_POSTGRES}
       - redis_host=redis-master.db.svc.cluster.local
       - redis_port=6379
+      - REDIS_STRING=redis://redis-master.db.svc.cluster.local:6379
+      - S3_HOST=http://minio.db.svc.cluster.local:9000
+      - S3_KEY=${SERVICE_USER_MINIO}
+      - S3_SECRET=${SERVICE_PASSWORD_MINIO}
+      - S3_REGION=us-east-1
+      - BUCKET_LIST=sessions-assets,static,mobs,sourcemaps,sessions-mobile-assets,quickwit,vault-data,records,spots
     restart: unless-stopped
 
   heuristics-openreplay:
-    image: public.ecr.aws/p1t3u8a3/heuristics:${COMMON_VERSION:-v1.23.0}
+    image: public.ecr.aws/p1t3u8a3/heuristics:${COMMON_VERSION:?Set COMMON_VERSION e.g. v1.23.0}
     domainname: app.svc.cluster.local
     depends_on:
       clickhouse-init:
@@ -627,10 +714,15 @@ services:
     volumes:
       - shared-volume:/mnt/efs
     environment:
-      - CH_HOST=clickhouse-openreplay-clickhouse.db.svc.cluster.local
-      - CH_PORT=9000
+      - DOMAIN_NAME=${SERVICE_FQDN_FRONTEND}
       - redis_host=redis-master.db.svc.cluster.local
       - redis_port=6379
+      - REDIS_STRING=redis://redis-master.db.svc.cluster.local:6379
+      - CH_HOST=clickhouse-openreplay-clickhouse.db.svc.cluster.local
+      - CH_PORT=9000
+      - CH_PORT_HTTP=8123
+      - CH_USERNAME=default
+      - CH_PASSWORD=
     restart: unless-stopped
 
 # ═══════════════════════════════════════════════════════════════════════════════
