@@ -8,7 +8,7 @@ Custom Docker Compose files and service templates for [Coolify](https://coolify.
 
 | Path | Purpose |
 |---|---|
-| `SKILL.md` | Claude Code skill (`/coolify-template`) that automates template creation and PR submission |
+| `SKILL.md` | Claude Code skill (`/coolify-template`) that automates template creation and both PRs |
 | `openreplay/` | OpenReplay self-hosted compose (Iran mirror variant) |
 | `posthog-iran-server/` | PostHog self-hosted compose (Iran mirror variant) |
 
@@ -16,7 +16,7 @@ Custom Docker Compose files and service templates for [Coolify](https://coolify.
 
 ## Submitting a new one-click service to coollabsio/coolify
 
-The `/coolify-template` skill handles the full pipeline — from reading upstream docs to opening the PR. The steps below explain what happens and what you need to do manually.
+The `/coolify-template` skill handles the full pipeline — from reading upstream docs to opening PRs in both the main repo and the docs repo. The steps below explain what happens and what you need to do manually.
 
 ### Prerequisites
 
@@ -24,7 +24,8 @@ The `/coolify-template` skill handles the full pipeline — from reading upstrea
 - [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated (`gh auth login`)
 - A local clone of the official repo: `git clone https://github.com/coollabsio/coolify`
 - PHP available in that repo's environment (for `php artisan generate:services`)
-- Your GitHub account must be **≥ 30 days old** (enforced by the PR quality bot)
+- [Bun](https://bun.sh/) available (for `bun run generate:services` in the docs repo)
+- Your GitHub account must be **>= 30 days old** (enforced by the PR quality bot)
 
 ---
 
@@ -39,7 +40,7 @@ Open Claude Code inside the **coollabsio/coolify** clone, then:
 or pass a GitHub URL directly:
 
 ```
-/coolify-template https://github.com/owner/service
+/coolify-template https://github.com/owner/your-service
 ```
 
 The skill will:
@@ -49,6 +50,8 @@ The skill will:
 3. Write `templates/compose/<service>.yaml`
 4. Find and save the SVG logo to `public/svgs/<service>.svg`
 5. Run `php artisan generate:services` to validate the YAML and regenerate JSON indexes
+6. Clone `coollabsio/coolify-docs`, create the service `.mdx` page and regenerate the docs listings
+7. Open both PRs automatically
 
 ---
 
@@ -107,7 +110,7 @@ Commit message rules enforced by the PR quality bot:
 
 ---
 
-### Step 5 — Push and open the PR
+### Step 5 — Push and open the coolify PR
 
 ```bash
 git push fork feat/<service>-template
@@ -166,6 +169,74 @@ EOF
 
 ---
 
+### Step 6 — Open the docs PR to coollabsio/coolify-docs
+
+After the coolify PR is open, a GitHub Actions bot will comment asking for a matching docs PR. The skill handles this automatically, but if you're doing it manually:
+
+```bash
+cd /tmp && git clone https://github.com/coollabsio/coolify-docs.git && cd coolify-docs
+bun install   # do NOT use --frozen-lockfile
+```
+
+Create `content/docs/services/<service>.mdx`:
+
+```mdx
+---
+title: "ServiceName"
+description: "Short description used on the listing card."
+category: "Monitoring"
+icon: "/docs/images/services/<service>-logo.svg"
+---
+
+# ServiceName
+
+## What is ServiceName?
+
+[2-3 paragraphs]
+
+## Links
+
+- [Official website](https://example.com?utm_source=coolify.io)
+- [GitHub](https://github.com/org/repo?utm_source=coolify.io)
+```
+
+Valid categories (case-sensitive): `Administration`, `AI`, `Analytics`, `Automation`, `Backup`, `Bookmarks`, `Browser`, `Business`, `CMS`, `Communication`, `Database`, `Development`, `Documentation`, `Email`, `File Management`, `Finance`, `Forum`, `Gaming`, `Media`, `Monitoring`, `Networking`, `Productivity`, `Project Management`, `Security`, `Social Media`, `Storage`, `Utilities`, and more — see SKILL.md for the full list.
+
+All external links must include `?utm_source=coolify.io`.
+
+Copy the logo and regenerate listings:
+
+```bash
+cp /path/to/coolify/public/svgs/<service>.svg public/images/services/<service>-logo.svg
+bun run generate:services
+```
+
+Commit and push — exactly 4 files:
+
+```bash
+git checkout -b feat/<service>-docs
+git add content/docs/services/<service>.mdx \
+        public/images/services/<service>-logo.svg \
+        src/generated/services.json \
+        content/docs/services/all.mdx
+git commit -m "feat(services): add <Service> documentation"
+git push origin feat/<service>-docs
+
+gh pr create \
+  --repo coollabsio/coolify-docs \
+  --base next \
+  --title "feat(services): add <Service> documentation" \
+  --body "Adds documentation for <Service> to accompany coollabsio/coolify#<PR-number>."
+```
+
+Then reply to the bot comment on the main coolify PR:
+
+```
+Hi! I've opened a matching docs PR: coollabsio/coolify-docs#<docs-pr-number>
+```
+
+---
+
 ### PR quality rules (enforced automatically)
 
 The repo uses [`peakoss/anti-slop`](https://github.com/peakoss/anti-slop) to auto-close low-quality PRs. The full list:
@@ -174,13 +245,13 @@ The repo uses [`peakoss/anti-slop`](https://github.com/peakoss/anti-slop) to aut
 |---|---|
 | Target branch | Must be `next` |
 | Source branch | Must not be `main`, `master`, or `v4.x` |
-| Description length | ≤ 2500 characters |
+| Description length | <= 2500 characters |
 | Blocked files | Do not include `service-templates-latest.json` or `service-templates.json` |
 | Commit footer | No `Co-Authored-By: Claude` in commit messages |
 | Blocked terms | No `STRAWBERRY` in the PR body (anti-bot trap in the PR template — do not copy it) |
 | PR template | Must include the Contributor Agreement section |
 | Conventional title | Must follow `type(scope): description` |
-| Account age | GitHub account must be ≥ 30 days old |
+| Account age | GitHub account must be >= 30 days old |
 
 If the quality bot closes the PR, read the actual workflow before guessing at the cause:
 
@@ -212,6 +283,7 @@ The skill covers:
 - Phase 2: Template file (variable conventions, Traefik routing, embedded configs, migrations)
 - Phase 3: SVG logo placement
 - Phase 4: `php artisan generate:services` + JSON verification
-- Phase 5: Fork setup, branch, commit, and PR submission
+- Phase 5: Fork setup, branch, commit, and PR to `coollabsio/coolify`
+- Phase 6: Docs page, logo, `bun run generate:services`, and PR to `coollabsio/coolify-docs`
 
 To use the skill in a different project, copy `SKILL.md` into that project's root or `.claude/` directory.

@@ -1,12 +1,12 @@
 ---
 name: coolify-template
-description: "Create a one-click deployable Docker Compose service template for Coolify (coollabsio/coolify). Use when the user wants to add a new service to Coolify's template catalog."
+description: "Create a one-click deployable Docker Compose service template for Coolify (coollabsio/coolify) and matching docs in coollabsio/coolify-docs. Use when the user wants to add a new service to Coolify's template catalog."
 trigger: /coolify-template
 ---
 
 # /coolify-template
 
-Turn an open-source project's Docker Compose setup into a Coolify one-click service template, including the YAML file, SVG logo, and a PR to the official repo.
+Turn an open-source project's Docker Compose setup into a Coolify one-click service template, including the YAML file, SVG logo, PRs to both `coollabsio/coolify` and `coollabsio/coolify-docs`.
 
 ## Usage
 
@@ -302,8 +302,124 @@ gh pr create \
 
 ---
 
+## Phase 6 — Documentation PR to coollabsio/coolify-docs
+
+After the coolify PR is open, a GitHub Actions bot will automatically comment asking for a matching docs PR. The bot comment reads roughly: "It appears you are adding or changing a service. Please also review the Coolify Documentation..."
+
+### Clone and set up
+
+```bash
+cd /tmp
+git clone https://github.com/coollabsio/coolify-docs.git
+cd coolify-docs
+bun install                  # do NOT use --frozen-lockfile; lockfile may have drifted
+```
+
+### Actual file structure (different from the docs skill)
+
+The `coolify-docs` repo's own documentation skill is outdated. The real paths are:
+
+```
+content/docs/services/<slug>.mdx          # service page (you create)
+public/images/services/<slug>-logo.svg    # logo (you add)
+src/generated/services.json              # generated — commit it
+content/docs/services/all.mdx            # generated — commit it
+```
+
+**Extension**: `.mdx`, not `.md`. **Logo prefix**: `<slug>-logo.svg`.
+
+### Create the service page
+
+`content/docs/services/<slug>.mdx` — use the minimal template unless the service is complex:
+
+```mdx
+---
+title: "ServiceName"
+description: "Short description used on the listing card."
+og:
+  description: "Longer SEO/social-card description — optional."
+category: "Monitoring"
+icon: "/docs/images/services/<slug>-logo.svg"
+---
+
+# ServiceName
+
+![ServiceName](/docs/images/services/<slug>-logo.svg)
+
+## What is ServiceName?
+
+[2-3 paragraphs: what it does, who it's for, primary use cases]
+
+## Features
+
+- **Feature 1:** description
+- **Feature 2:** description
+
+## Links
+
+- [Official website](https://example.com?utm_source=coolify.io)
+- [GitHub](https://github.com/org/repo?utm_source=coolify.io)
+- [Documentation](https://docs.example.com?utm_source=coolify.io)
+```
+
+Valid categories (match exactly, including capitalisation): `Administration`, `AI`, `Analytics`, `Automation`, `Backup`, `Bookmarks`, `Browser`, `Business`, `CMS`, `Communication`, `Crypto`, `Database`, `Design`, `Development`, `Documentation`, `Education`, `Email`, `Family`, `File Management`, `File Sharing`, `Finance`, `Forum`, `Gaming`, `Health`, `Home`, `IoT`, `Marketing`, `Media`, `Monitoring`, `Networking`, `Notifications`, `Productivity`, `Project Management`, `RSS`, `Search`, `Security`, `Social Media`, `Storage`, `Utilities`.
+
+All external links must have `?utm_source=coolify.io`.
+
+### Add the logo
+
+Copy from `public/svgs/<service>.svg` in the coolify repo (or fetch from upstream):
+
+```bash
+cp /path/to/coolify/public/svgs/<service>.svg public/images/services/<service>-logo.svg
+```
+
+### Regenerate listings
+
+```bash
+bun run generate:services
+```
+
+This writes `src/generated/services.json` and `content/docs/services/all.mdx`.
+
+Verify the entry appeared:
+```bash
+grep -A3 '"<ServiceName>"' src/generated/services.json
+```
+
+### Commit and open PR
+
+```bash
+git checkout -b feat/<service>-docs
+git add content/docs/services/<service>.mdx \
+        public/images/services/<service>-logo.svg \
+        src/generated/services.json \
+        content/docs/services/all.mdx
+git commit -m "feat(services): add OpenReplay documentation"
+git push origin feat/<service>-docs
+
+gh pr create \
+  --repo coollabsio/coolify-docs \
+  --base next \
+  --title "feat(services): add <Service> documentation" \
+  --body "Adds documentation for <Service> to accompany coollabsio/coolify#<PR-number>."
+```
+
+PR must target the `next` branch, not `main`.
+
+### Reply to the docs-bot on the coolify PR
+
+After the docs PR is open, reply to the bot's comment on the main coolify PR:
+
+```
+Hi! I've opened a matching docs PR: coollabsio/coolify-docs#<docs-pr-number>
+```
+
+---
+
 ## Checklist
 
+### Template (coolify repo)
 - [ ] Upstream Docker Compose and all env files read
 - [ ] Entry point service identified, `SERVICE_URL_*_PORT` assigned
 - [ ] All `${COMMON_*}` / `${APP_*}` variables mapped to `SERVICE_PASSWORD_*` equivalents
@@ -316,3 +432,13 @@ gh pr create \
 - [ ] JSON files NOT staged
 - [ ] PR targets `next` branch
 - [ ] PR description ≤ 2500 chars, no blocked terms
+
+### Documentation (coolify-docs repo)
+- [ ] `content/docs/services/<service>.mdx` created with valid frontmatter
+- [ ] Category matches an existing value exactly (case-sensitive)
+- [ ] All external links include `?utm_source=coolify.io`
+- [ ] Logo saved to `public/images/services/<service>-logo.svg`
+- [ ] `bun run generate:services` ran and entry appears in `src/generated/services.json`
+- [ ] 4 files staged: mdx, logo, services.json, all.mdx
+- [ ] PR targets `next` on `coollabsio/coolify-docs`
+- [ ] Replied to the docs-bot comment on the main coolify PR with the docs PR link
